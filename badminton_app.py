@@ -8,13 +8,12 @@ from datetime import datetime
 # ==========================================
 # 0. DEFAULT CONFIGURATION
 # ==========================================
-# We use a "Flat" structure for questions to make them easy to edit in a table
 DEFAULT_CONFIG = {
     "initial_mu": 25.0,
     "initial_sigma": 8.333,
-    "beta": 4.167,      # Skill gap (points) needed for ~80% win probability
-    "tau": 0.1,         # Dynamics: Uncertainty added per game (prevents stagnation)
-    "score_lever": 0.5, # How much the score margin (e.g. 21-5) weighs vs just winning
+    "beta": 4.167,      
+    "tau": 0.1,         
+    "score_lever": 0.5, 
     "questions": [
         {"group": "Service", "option": "Frequent High/Out", "score": -5},
         {"group": "Service", "option": "Consistent Low", "score": 0},
@@ -41,7 +40,7 @@ def init_db():
     conn = get_db_connection()
     c = conn.cursor()
     
-    # Config Table (Singleton)
+    # Config Table
     c.execute('''CREATE TABLE IF NOT EXISTS config (
                     id INTEGER PRIMARY KEY,
                     settings TEXT
@@ -116,8 +115,6 @@ class RatingEngine:
         self.score_lever = config['score_lever']
 
     def get_display_rating(self, mu, sigma):
-        # Conservative Rating: Mu - 3*Sigma
-        # Ensures new players prove themselves before getting a high rank
         return max(0, mu - (3 * sigma))
 
     def calculate_update(self, w_team, l_team, score_w, score_l):
@@ -141,14 +138,12 @@ class RatingEngine:
         # Calculate Updates
         w_updates, l_updates = [], []
 
-        # Winners
         for p in w_team:
             mean_delta = (p['sigma']**2 / c) * surprise * margin_multiplier
             reduction = (p['sigma']**2 / c**2)
             new_sigma = math.sqrt(p['sigma']**2 * (1 - reduction) + self.tau**2)
             w_updates.append({'mu_new': p['mu'] + mean_delta, 'sigma_new': new_sigma, 'delta': mean_delta})
 
-        # Losers
         for p in l_team:
             mean_delta = (p['sigma']**2 / c) * surprise * margin_multiplier
             reduction = (p['sigma']**2 / c**2)
@@ -203,7 +198,6 @@ def save_match(match_type, winners, losers, score_w, score_l, updates_w, updates
     col_mu = 'mu_s' if match_type == 'Singles' else 'mu_d'
     col_sigma = 'sigma_s' if match_type == 'Singles' else 'sigma_d'
     
-    # Update DB
     for i, p_id in enumerate(w_ids):
         c.execute(f"UPDATE players SET {col_mu} = ?, {col_sigma} = ? WHERE id = ?", 
                   (updates_w[i]['mu_new'], updates_w[i]['sigma_new'], p_id))
@@ -254,41 +248,29 @@ st.title("🏸 Badminton League Manager")
 
 tabs = st.tabs(["1. Register Player", "2. Log Match", "3. Profiles", "⚙️ Configuration"])
 
-# --- TAB 1: DYNAMIC REGISTRATION ---
+# --- TAB 1: REGISTER ---
 with tabs[0]:
     st.header("New Player Registration")
-    
-    # 1. Get Questions from Config
     q_df = pd.DataFrame(current_config['questions'])
-    
     col1, col2 = st.columns([1, 1])
     selections = {}
     
     with col1:
         name_input = st.text_input("Player Name")
         st.subheader("Self Evaluation")
-        
         if q_df.empty:
             st.warning("No questions configured! Go to the Configuration tab.")
         else:
-            # 2. Dynamic Loop to build UI
             groups = q_df['group'].unique()
             for g in groups:
-                # Filter options for this group (e.g., 'Service')
                 options = q_df[q_df['group'] == g]
-                
-                # Map 'Option Text' -> Score
                 opt_map = dict(zip(options['option'], options['score']))
-                
-                # Create Selectbox
                 choice = st.selectbox(f"{g}", options['option'], key=f"reg_{g}")
                 selections[g] = opt_map[choice]
 
     with col2:
-        # Calculate Score Real-time
         total_adj = sum(selections.values())
         base_mu = current_config['initial_mu']
-        
         st.metric("Base Rating (Configured)", f"{base_mu}")
         st.metric("Assessment Adjustment", f"{total_adj:+.0f}")
         st.metric("Final Estimated Skill (Mu)", f"{base_mu + total_adj}")
@@ -305,7 +287,7 @@ with tabs[0]:
     if not players.empty:
         st.dataframe(players[['name', 'initial_score', 'joined_date']].tail(5), hide_index=True)
 
-# --- TAB 2: LOG MATCH ---
+# --- TAB 2: MATCHES ---
 with tabs[1]:
     st.header("Log Game Result")
     players = get_players()
@@ -343,7 +325,6 @@ with tabs[1]:
             score_l = st.number_input("Score", 0, 30, 19, key="sl")
 
         if st.button("Submit Match Result", use_container_width=True):
-            # Helper to package data
             def get_data(name, mode):
                 row = player_map[name]
                 if mode == 'Singles':
@@ -355,53 +336,39 @@ with tabs[1]:
             l_team = [get_data(l1, m_type)]
             if l2: l_team.append(get_data(l2, m_type))
             
-            # Execute
             w_updates, l_updates = engine.calculate_update(w_team, l_team, score_w, score_l)
             save_match(m_type, w_team, l_team, score_w, score_l, w_updates, l_updates)
             
             st.success("Match Processed!")
-            
-            # Show Deltas
             cols = st.columns(len(w_updates) + len(l_updates))
             all_updates = w_updates + l_updates
             all_names = [p['name'] for p in w_team] + [p['name'] for p in l_team]
             
             for i, p in enumerate(all_updates):
                 new_rating = engine.get_display_rating(p['mu_new'], p['sigma_new'])
-                delta_color = "normal" if p['delta'] > 0 else "off"
                 cols[i].metric(label=all_names[i], value=f"{new_rating:.1f}", delta=f"{p['delta']:.2f}")
 
 # --- TAB 3: PROFILES ---
 with tabs[2]:
     st.header("Leaderboard & Profiles")
     players = get_players()
-    
     if not players.empty:
-        # Computed Columns
         players['Singles Rating'] = players.apply(lambda x: engine.get_display_rating(x['mu_s'], x['sigma_s']), axis=1).round(1)
         players['Doubles Rating'] = players.apply(lambda x: engine.get_display_rating(x['mu_d'], x['sigma_d']), axis=1).round(1)
         
         st.dataframe(
             players[['name', 'Singles Rating', 'Doubles Rating', 'joined_date']].sort_values(by='Doubles Rating', ascending=False),
-            use_container_width=True,
-            hide_index=True
+            use_container_width=True, hide_index=True
         )
-        
         st.divider()
         c1, c2 = st.columns([1, 2])
-        
         with c1:
             selected = st.selectbox("View Player Details", players['name'].unique())
             p_row = players[players['name'] == selected].iloc[0]
-            
             st.markdown(f"### {selected}")
-            st.caption(f"Joined: {p_row['joined_date']}")
-            st.write(f"**Initial Self-Eval Score:** {p_row['initial_score']}")
-            
-            st.info("Ratings breakdown:")
-            st.write(f"Singles: **{p_row['Singles Rating']}** (μ={p_row['mu_s']:.1f}, σ={p_row['sigma_s']:.1f})")
-            st.write(f"Doubles: **{p_row['Doubles Rating']}** (μ={p_row['mu_d']:.1f}, σ={p_row['sigma_d']:.1f})")
-
+            st.write(f"**Eval Score:** {p_row['initial_score']}")
+            st.write(f"Singles: **{p_row['Singles Rating']}**")
+            st.write(f"Doubles: **{p_row['Doubles Rating']}**")
         with c2:
             st.subheader("Match Log")
             hist = get_match_history(p_row['id'])
@@ -410,37 +377,49 @@ with tabs[2]:
             else:
                 st.write("No matches played yet.")
 
-# --- TAB 4: CONFIGURATION (NEW) ---
+# --- TAB 4: CONFIGURATION (ENHANCED) ---
 with tabs[3]:
     st.header("⚙️ System Configuration")
-    st.warning("⚠️ CHANGING SETTINGS AND SAVING WILL RESET THE DATABASE (ALL PLAYERS/MATCHES DELETED)")
+    
+    with st.expander("📖 Guide to Rating Physics (Read this to understand the Levers)"):
+        st.markdown("""
+        **1. Initial Mean (μ) & Uncertainty (σ)**
+        *   **Mean (μ):** The average skill level. Standard is 25.0. 
+        *   **Uncertainty (σ):** How unsure the system is. If σ is 8.0, the system thinks a player is somewhere between 1 (Novice) and 49 (Pro).
+        
+        **2. The Skill Gap (Beta)**
+        *   **Low Beta (<3.0):** Aggressive. Assumes pure skill. Ratings swing wildly.
+        *   **High Beta (>5.0):** Conservative. Assumes luck is involved. Ratings change slowly.
+        
+        **3. Score Weight Factor**
+        *   **0.0:** A win is a win. 21-19 is the same as 21-0.
+        *   **1.0:** Ruthless. A 21-0 win gives massive points compared to a close game.
+        """)
+
+    st.error("⚠️ WARNING: SAVING CONFIGURATION WILL FACTORY RESET THE DATABASE (ALL PLAYERS & MATCHES DELETED)")
     
     with st.form("config_form"):
         col1, col2 = st.columns(2)
         
         with col1:
             st.subheader("1. Mathematical Levers")
-            new_mu = st.number_input("Initial Mean (Mu)", value=current_config['initial_mu'])
-            new_sigma = st.number_input("Initial Uncertainty (Sigma)", value=current_config['initial_sigma'])
-            new_beta = st.number_input("Skill Gap (Beta)", value=current_config['beta'], help="Points of skill difference for ~80% win chance")
-            new_tau = st.number_input("Dynamics (Tau)", value=current_config['tau'], help="Uncertainty added per game")
-            new_lever = st.number_input("Score Weight Factor", value=current_config['score_lever'], help="Higher = Score margin matters more")
+            new_mu = st.number_input("Initial Mean (μ)", value=current_config['initial_mu'], help="Standard: 25.0")
+            new_sigma = st.number_input("Initial Uncertainty (σ)", value=current_config['initial_sigma'], help="Standard: 8.33")
+            new_beta = st.number_input("Skill Gap / Luck (Beta)", value=current_config['beta'], help="Standard: 4.16")
+            new_tau = st.number_input("Dynamics (Tau)", value=current_config['tau'], help="Standard: 0.1")
+            new_lever = st.number_input("Score Weight Factor", value=current_config['score_lever'], help="Standard: 0.5")
 
         with col2:
             st.subheader("2. Self-Evaluation Questions")
-            st.info("Edit the table below. Add rows to add new options.")
-            
-            # Load current questions into a DataFrame for editing
+            st.info("Edit the table below to change registration questions.")
             q_df = pd.DataFrame(current_config['questions'])
-            
-            # Interactive Data Editor
             edited_df = st.data_editor(
                 q_df, 
                 num_rows="dynamic", 
                 column_config={
-                    "group": st.column_config.TextColumn("Question Group", help="Groups options into one dropdown (e.g. Service)"),
-                    "option": st.column_config.TextColumn("Option Text", help="The answer choice shown to user"),
-                    "score": st.column_config.NumberColumn("Score Impact", help="Points added/subtracted from Mu")
+                    "group": st.column_config.TextColumn("Group"),
+                    "option": st.column_config.TextColumn("Answer"),
+                    "score": st.column_config.NumberColumn("Points")
                 },
                 use_container_width=True
             )
@@ -448,7 +427,6 @@ with tabs[3]:
         submit = st.form_submit_button("💾 Save Configuration & RESET Database", type="primary")
         
         if submit:
-            # Reconstruct Config Object
             new_config = {
                 "initial_mu": new_mu,
                 "initial_sigma": new_sigma,
@@ -457,8 +435,46 @@ with tabs[3]:
                 "score_lever": new_lever,
                 "questions": edited_df.to_dict(orient="records")
             }
-            
-            # Save and Reset
             save_config_and_reset(new_config)
-            st.success("System updated and database reset. Please refresh the page.")
+            st.success("System updated and database reset. Refreshing...")
             st.rerun()
+
+    # --- ACCESSIBLE DESCRIPTION ---
+    st.divider()
+    st.subheader("🔎 Current System State Summary")
+    
+    # 1. Calculate New Player Ranges based on questions
+    # We sum the MIN score of every group to get the floor, and MAX for the ceiling
+    q_df_final = pd.DataFrame(current_config['questions'])
+    if not q_df_final.empty:
+        min_adj = q_df_final.groupby('group')['score'].min().sum()
+        max_adj = q_df_final.groupby('group')['score'].max().sum()
+    else:
+        min_adj, max_adj = 0, 0
+    
+    base_mu = current_config['initial_mu']
+    
+    # 2. Interpret Physics
+    if current_config['beta'] < 3.0: phys_desc = "Aggressive / High Volatility"
+    elif current_config['beta'] > 5.0: phys_desc = "Conservative / Slow Moving"
+    else: phys_desc = "Balanced / Standard Competition"
+    
+    if current_config['score_lever'] < 0.2: score_desc = "Winning is everything (Score margin irrelevant)"
+    elif current_config['score_lever'] > 0.8: score_desc = "Blowouts matter heavily"
+    else: score_desc = "Balanced (Score margin matters moderately)"
+
+    c_a, c_b = st.columns(2)
+    with c_a:
+        st.info(f"""
+        **League Physics:** {phys_desc}
+        *   **Volatility:** The system assumes a skill gap of **{current_config['beta']}** points guarantees a win.
+        *   **Scoring:** {score_desc}.
+        """)
+    with c_b:
+        st.success(f"""
+        **New Player Entry Range:**
+        *   Based on the **{len(q_df_final['group'].unique()) if not q_df_final.empty else 0}** active question groups:
+        *   A total beginner starts with Skill **{base_mu + min_adj:.1f}**.
+        *   A pro starts with Skill **{base_mu + max_adj:.1f}**.
+        *   *Note: Visible ratings start near 0 until uncertainty (σ) drops.*
+        """)
