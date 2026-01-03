@@ -6,182 +6,220 @@ import pandas as pd
 from datetime import datetime
 
 # ==========================================
-# 1. BAYESIAN RATING ENGINE
+# 0. DEFAULT CONFIGURATION
 # ==========================================
-
-class RatingEngine:
-    """
-    Manages the mathematics of the rating system.
-    """
-    def __init__(self, initial_mu=25.0, initial_sigma=8.333, beta=4.167, tau=0.1):
-        self.initial_mu = initial_mu
-        self.initial_sigma = initial_sigma
-        self.beta = beta  # The skill gap required for ~80% win probability
-        self.tau = tau    # Dynamics: Prevents uncertainty from hitting zero
-
-    def get_conservative_rating(self, mu, sigma):
-        """
-        Returns the user-facing rating (Mu - 3*Sigma).
-        New players start near 0. Proven players rise.
-        """
-        return max(0, mu - (3 * sigma))
-
-    def calculate_update(self, w_team, l_team, score_w, score_l):
-        """
-        Calculates new ratings for a match (1v1 or 2v2).
-        w_team/l_team: List of dicts {'mu', 'sigma'}
-        """
-        # 1. Aggregate Team Parameters (Sum of Means, Sum of Variances)
-        mu_w = sum(p['mu'] for p in w_team)
-        mu_l = sum(p['mu'] for p in l_team)
-        sigma_sq_w = sum(p['sigma']**2 for p in w_team)
-        sigma_sq_l = sum(p['sigma']**2 for p in l_team)
-
-        # 2. Score Lever: Logarithmic Multiplier
-        # 21-19 (Diff 2) -> ~1.2x
-        # 21-5  (Diff 16)-> ~2.2x
-        score_diff = score_w - score_l
-        margin_multiplier = 1 + 0.45 * math.log(score_diff + 1)
-
-        # 3. Prediction & Surprise
-        # c = Total uncertainty in the match
-        c = math.sqrt(sigma_sq_w + sigma_sq_l + 2 * (self.beta**2))
-        diff = mu_w - mu_l
-        
-        # t = Normalized skill difference
-        t = diff / c
-        # Expected win probability
-        prob = 1 / (1 + math.exp(-t)) 
-        
-        # Surprise: High surprise if underdog wins
-        surprise = 1 - prob
-        
-        # 4. Calculate Updates
-        w_updates = []
-        l_updates = []
-
-        # Update Winners
-        for p in w_team:
-            # Credit Assignment: Players with higher uncertainty get larger updates
-            mean_delta = (p['sigma']**2 / c) * surprise * margin_multiplier
-            
-            # Uncertainty shrinks (learning occurred)
-            reduction = (p['sigma']**2 / c**2)
-            new_sigma = math.sqrt(p['sigma']**2 * (1 - reduction) + self.tau**2)
-            
-            w_updates.append({
-                'mu_new': p['mu'] + mean_delta, 
-                'sigma_new': new_sigma,
-                'delta': mean_delta
-            })
-
-        # Update Losers
-        for p in l_team:
-            mean_delta = (p['sigma']**2 / c) * surprise * margin_multiplier
-            reduction = (p['sigma']**2 / c**2)
-            new_sigma = math.sqrt(p['sigma']**2 * (1 - reduction) + self.tau**2)
-            
-            l_updates.append({
-                'mu_new': p['mu'] - mean_delta, 
-                'sigma_new': new_sigma,
-                'delta': -mean_delta
-            })
-
-        return w_updates, l_updates
-
-engine = RatingEngine()
+# We use a "Flat" structure for questions to make them easy to edit in a table
+DEFAULT_CONFIG = {
+    "initial_mu": 25.0,
+    "initial_sigma": 8.333,
+    "beta": 4.167,      # Skill gap (points) needed for ~80% win probability
+    "tau": 0.1,         # Dynamics: Uncertainty added per game (prevents stagnation)
+    "score_lever": 0.5, # How much the score margin (e.g. 21-5) weighs vs just winning
+    "questions": [
+        {"group": "Service", "option": "Frequent High/Out", "score": -5},
+        {"group": "Service", "option": "Consistent Low", "score": 0},
+        {"group": "Service", "option": "Deceptive/Flick", "score": 3},
+        {"group": "Clears", "option": "Mid-court struggle", "score": -5},
+        {"group": "Clears", "option": "Base-to-Base (Forehand)", "score": 2},
+        {"group": "Clears", "option": "Base-to-Base (Backhand)", "score": 5},
+        {"group": "Tactics", "option": "Side-by-side only", "score": -2},
+        {"group": "Tactics", "option": "Rotation (Front/Back)", "score": 3},
+        {"group": "Experience", "option": "Beginner", "score": -5},
+        {"group": "Experience", "option": "Social/Club", "score": 0},
+        {"group": "Experience", "option": "Tournament", "score": 5}
+    ]
+}
 
 # ==========================================
-# 2. DATABASE (SQLite)
+# 1. DATABASE LAYER
 # ==========================================
+
+def get_db_connection():
+    return sqlite3.connect('badminton_league.db')
 
 def init_db():
-    """Initialize database with separate Singles/Doubles profiles."""
-    conn = sqlite3.connect('badminton_ratings.db')
+    conn = get_db_connection()
     c = conn.cursor()
     
+    # Config Table (Singleton)
+    c.execute('''CREATE TABLE IF NOT EXISTS config (
+                    id INTEGER PRIMARY KEY,
+                    settings TEXT
+                )''')
+    
+    # Players Table
     c.execute('''CREATE TABLE IF NOT EXISTS players (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT UNIQUE,
                     mu_s REAL, sigma_s REAL,
                     mu_d REAL, sigma_d REAL,
-                    initial_answers TEXT,
+                    initial_score REAL,
                     joined_date TEXT
                 )''')
     
+    # Matches Table
     c.execute('''CREATE TABLE IF NOT EXISTS matches (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     date TEXT,
                     match_type TEXT,
-                    winners TEXT,
-                    losers TEXT,
-                    score_w INTEGER,
-                    score_l INTEGER,
+                    winners TEXT, losers TEXT,
+                    score_w INTEGER, score_l INTEGER,
                     rating_changes TEXT
                 )''')
+
+    # Seed Default Config if empty
+    c.execute("SELECT count(*) FROM config")
+    if c.fetchone()[0] == 0:
+        c.execute("INSERT INTO config (id, settings) VALUES (1, ?)", (json.dumps(DEFAULT_CONFIG),))
+    
     conn.commit()
     conn.close()
 
-def add_player(name, answers, initial_mu_adj):
-    conn = sqlite3.connect('badminton_ratings.db')
+def get_config():
+    """Load the current configuration from DB."""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT settings FROM config WHERE id=1")
+    res = c.fetchone()
+    conn.close()
+    if res:
+        return json.loads(res[0])
+    return DEFAULT_CONFIG
+
+def save_config_and_reset(new_config):
+    """Updates config and WIPES all data to ensure consistency."""
+    conn = get_db_connection()
     c = conn.cursor()
     
-    base_mu = 25.0
-    start_mu = base_mu + initial_mu_adj
-    start_sigma = 8.333 # High uncertainty for everyone initially
+    # 1. Drop Data Tables
+    c.execute("DROP TABLE IF EXISTS players")
+    c.execute("DROP TABLE IF EXISTS matches")
+    
+    # 2. Update Config
+    c.execute("UPDATE config SET settings = ? WHERE id=1", (json.dumps(new_config),))
+    
+    # 3. Commit and Re-init
+    conn.commit()
+    conn.close()
+    init_db() 
+
+# ==========================================
+# 2. RATING ENGINE (Dynamic)
+# ==========================================
+
+class RatingEngine:
+    def __init__(self, config):
+        self.mu = config['initial_mu']
+        self.sigma = config['initial_sigma']
+        self.beta = config['beta']
+        self.tau = config['tau']
+        self.score_lever = config['score_lever']
+
+    def get_display_rating(self, mu, sigma):
+        # Conservative Rating: Mu - 3*Sigma
+        # Ensures new players prove themselves before getting a high rank
+        return max(0, mu - (3 * sigma))
+
+    def calculate_update(self, w_team, l_team, score_w, score_l):
+        # Aggregate Team Stats
+        mu_w = sum(p['mu'] for p in w_team)
+        mu_l = sum(p['mu'] for p in l_team)
+        sigma_sq_w = sum(p['sigma']**2 for p in w_team)
+        sigma_sq_l = sum(p['sigma']**2 for p in l_team)
+
+        # Dynamic Score Lever
+        score_diff = score_w - score_l
+        margin_multiplier = 1 + self.score_lever * math.log(score_diff + 1)
+
+        # Prediction Math
+        c = math.sqrt(sigma_sq_w + sigma_sq_l + 2 * (self.beta**2))
+        diff = mu_w - mu_l
+        t = diff / c
+        prob = 1 / (1 + math.exp(-t)) 
+        surprise = 1 - prob
+        
+        # Calculate Updates
+        w_updates, l_updates = [], []
+
+        # Winners
+        for p in w_team:
+            mean_delta = (p['sigma']**2 / c) * surprise * margin_multiplier
+            reduction = (p['sigma']**2 / c**2)
+            new_sigma = math.sqrt(p['sigma']**2 * (1 - reduction) + self.tau**2)
+            w_updates.append({'mu_new': p['mu'] + mean_delta, 'sigma_new': new_sigma, 'delta': mean_delta})
+
+        # Losers
+        for p in l_team:
+            mean_delta = (p['sigma']**2 / c) * surprise * margin_multiplier
+            reduction = (p['sigma']**2 / c**2)
+            new_sigma = math.sqrt(p['sigma']**2 * (1 - reduction) + self.tau**2)
+            l_updates.append({'mu_new': p['mu'] - mean_delta, 'sigma_new': new_sigma, 'delta': -mean_delta})
+
+        return w_updates, l_updates
+
+# Load Config & Engine
+init_db()
+current_config = get_config()
+engine = RatingEngine(current_config)
+
+# ==========================================
+# 3. DATA ACCESS HELPERS
+# ==========================================
+
+def add_player(name, initial_score_adj):
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    start_mu = current_config['initial_mu'] + initial_score_adj
+    start_sigma = current_config['initial_sigma']
     
     try:
-        # Initialize both Singles (_s) and Doubles (_d) with the same prior
         c.execute('''INSERT INTO players 
-                     (name, mu_s, sigma_s, mu_d, sigma_d, initial_answers, joined_date) 
+                     (name, mu_s, sigma_s, mu_d, sigma_d, initial_score, joined_date) 
                      VALUES (?, ?, ?, ?, ?, ?, ?)''',
                   (name, start_mu, start_sigma, start_mu, start_sigma, 
-                   json.dumps(answers), datetime.now().strftime("%Y-%m-%d")))
+                   initial_score_adj, datetime.now().strftime("%Y-%m-%d")))
         conn.commit()
-        st.success(f"Player '{name}' registered with Skill Estimate: {start_mu}")
+        st.toast(f"Player '{name}' registered!", icon="✅")
     except sqlite3.IntegrityError:
         st.error("Player name already exists.")
     finally:
         conn.close()
 
 def get_players():
-    conn = sqlite3.connect('badminton_ratings.db')
+    conn = get_db_connection()
     df = pd.read_sql_query("SELECT * FROM players", conn)
     conn.close()
     return df
 
 def save_match(match_type, winners, losers, score_w, score_l, updates_w, updates_l):
-    conn = sqlite3.connect('badminton_ratings.db')
+    conn = get_db_connection()
     c = conn.cursor()
     
     w_ids = [p['id'] for p in winners]
     l_ids = [p['id'] for p in losers]
     changes = {'winners': updates_w, 'losers': updates_l}
     
-    # Dynamically select columns based on match type
     col_mu = 'mu_s' if match_type == 'Singles' else 'mu_d'
     col_sigma = 'sigma_s' if match_type == 'Singles' else 'sigma_d'
     
-    # Update Winners
+    # Update DB
     for i, p_id in enumerate(w_ids):
         c.execute(f"UPDATE players SET {col_mu} = ?, {col_sigma} = ? WHERE id = ?", 
                   (updates_w[i]['mu_new'], updates_w[i]['sigma_new'], p_id))
-    # Update Losers
     for i, p_id in enumerate(l_ids):
         c.execute(f"UPDATE players SET {col_mu} = ?, {col_sigma} = ? WHERE id = ?", 
                   (updates_l[i]['mu_new'], updates_l[i]['sigma_new'], p_id))
         
-    # Log Match
     c.execute('''INSERT INTO matches (date, match_type, winners, losers, score_w, score_l, rating_changes)
                  VALUES (?, ?, ?, ?, ?, ?, ?)''',
               (datetime.now().strftime("%Y-%m-%d %H:%M"), match_type, 
                json.dumps(w_ids), json.dumps(l_ids), score_w, score_l, json.dumps(changes)))
-    
     conn.commit()
     conn.close()
 
 def get_match_history(player_id):
-    conn = sqlite3.connect('badminton_ratings.db')
+    conn = get_db_connection()
     df = pd.read_sql_query("SELECT * FROM matches ORDER BY id DESC", conn)
     conn.close()
     
@@ -193,7 +231,6 @@ def get_match_history(player_id):
         if player_id in winners or player_id in losers:
             row_data = row.to_dict()
             changes = json.loads(row['rating_changes'])
-            
             if player_id in winners:
                 idx = winners.index(player_id)
                 delta = changes['winners'][idx]['delta']
@@ -202,71 +239,71 @@ def get_match_history(player_id):
                 idx = losers.index(player_id)
                 delta = changes['losers'][idx]['delta']
                 res = "Loss"
-                
             row_data['result'] = res
             row_data['change'] = round(delta, 2)
             history.append(row_data)
-            
     return pd.DataFrame(history)
 
 # ==========================================
-# 3. STREAMLIT UI
+# 4. STREAMLIT UI
 # ==========================================
 
-st.set_page_config(page_title="Badminton Ratings", layout="wide")
-init_db()
+st.set_page_config(page_title="Badminton League", layout="wide", page_icon="🏸")
 
-st.title("🏸 Bayesian Badminton Rater")
+st.title("🏸 Badminton League Manager")
 
-tabs = st.tabs(["1. Register Player", "2. Log Match", "3. Profiles & Leaderboard"])
+tabs = st.tabs(["1. Register Player", "2. Log Match", "3. Profiles", "⚙️ Configuration"])
 
-# --- TAB 1: REGISTER ---
+# --- TAB 1: DYNAMIC REGISTRATION ---
 with tabs[0]:
     st.header("New Player Registration")
     
-    col1, col2 = st.columns([1, 2])
+    # 1. Get Questions from Config
+    q_df = pd.DataFrame(current_config['questions'])
+    
+    col1, col2 = st.columns([1, 1])
+    selections = {}
     
     with col1:
         name_input = st.text_input("Player Name")
         st.subheader("Self Evaluation")
-        st.info("These questions set your initial skill level (Prior).")
         
-        # Questions mapped to skill adjustments
-        q1 = st.selectbox("Serve", ["High/Out frequently (-5)", "Consistent Low (0)", "Deceptive/Flick (+3)"], index=1)
-        q2 = st.selectbox("Clears", ["Mid-court only (-5)", "Base-to-Base Forehand (+2)", "Base-to-Base Backhand (+5)"], index=1)
-        q3 = st.selectbox("Tactics", ["Side-by-side only (-2)", "Rotation (Front/Back) (+3)"], index=0)
-        q4 = st.selectbox("Experience", ["Beginner (-5)", "Social/Club (0)", "Tournament (+5)"], index=1)
+        if q_df.empty:
+            st.warning("No questions configured! Go to the Configuration tab.")
+        else:
+            # 2. Dynamic Loop to build UI
+            groups = q_df['group'].unique()
+            for g in groups:
+                # Filter options for this group (e.g., 'Service')
+                options = q_df[q_df['group'] == g]
+                
+                # Map 'Option Text' -> Score
+                opt_map = dict(zip(options['option'], options['score']))
+                
+                # Create Selectbox
+                choice = st.selectbox(f"{g}", options['option'], key=f"reg_{g}")
+                selections[g] = opt_map[choice]
 
     with col2:
-        # Calculate Preview
-        score = 0
-        if "High" in q1: score -= 5
-        elif "Deceptive" in q1: score += 3
+        # Calculate Score Real-time
+        total_adj = sum(selections.values())
+        base_mu = current_config['initial_mu']
         
-        if "Mid" in q2: score -= 5
-        elif "Backhand" in q2: score += 5
-        else: score += 2
+        st.metric("Base Rating (Configured)", f"{base_mu}")
+        st.metric("Assessment Adjustment", f"{total_adj:+.0f}")
+        st.metric("Final Estimated Skill (Mu)", f"{base_mu + total_adj}")
         
-        if "Side" in q3: score -= 2
-        else: score += 3
-        
-        if "Beginner" in q4: score -= 5
-        elif "Tournament" in q4: score += 5
-        
-        st.metric("Estimated Initial Skill (Mu)", f"{25 + score}")
-        
-        if st.button("Register Player"):
+        if st.button("Register Player", type="primary"):
             if name_input:
-                answers = {"Serve": q1, "Clears": q2, "Tactics": q3, "Exp": q4}
-                add_player(name_input, answers, score)
+                add_player(name_input, total_adj)
             else:
-                st.warning("Please enter a name.")
+                st.warning("Enter a name.")
     
     st.divider()
-    st.write("Recent Players:")
+    st.caption("Recent Joins")
     players = get_players()
     if not players.empty:
-        st.dataframe(players[['name', 'joined_date']].tail(5))
+        st.dataframe(players[['name', 'initial_score', 'joined_date']].tail(5), hide_index=True)
 
 # --- TAB 2: LOG MATCH ---
 with tabs[1]:
@@ -274,23 +311,26 @@ with tabs[1]:
     players = get_players()
     
     if players.empty:
-        st.warning("No players found.")
+        st.info("Register players in Tab 1 to start logging matches.")
     else:
-        m_type = st.radio("Match Type", ["Singles", "Doubles"])
+        m_type = st.radio("Match Type", ["Singles", "Doubles"], horizontal=True)
         player_map = {row['name']: row for _, row in players.iterrows()}
         p_names = list(player_map.keys())
         
-        col_w, col_l = st.columns(2)
+        c1, c2, c3 = st.columns([2, 0.5, 2])
         
-        with col_w:
+        with c1:
             st.subheader("Winners")
             w1 = st.selectbox("Winner 1", p_names, key="w1")
             w2 = None
             if m_type == "Doubles":
                 w2 = st.selectbox("Winner 2", [p for p in p_names if p != w1], key="w2")
-            score_w = st.number_input("Winner Score", 0, 30, 21)
+            score_w = st.number_input("Score", 0, 30, 21, key="sw")
 
-        with col_l:
+        with c2:
+            st.markdown("<br><br><h3 style='text-align: center'>VS</h3>", unsafe_allow_html=True)
+
+        with c3:
             st.subheader("Losers")
             used = [w1]
             if w2: used.append(w2)
@@ -300,10 +340,10 @@ with tabs[1]:
             if m_type == "Doubles":
                 avail2 = [p for p in avail if p != l1]
                 l2 = st.selectbox("Loser 2", avail2, key="l2")
-            score_l = st.number_input("Loser Score", 0, 30, 15)
+            score_l = st.number_input("Score", 0, 30, 19, key="sl")
 
-        if st.button("Calculate & Submit"):
-            # Prepare data structure for the engine
+        if st.button("Submit Match Result", use_container_width=True):
+            # Helper to package data
             def get_data(name, mode):
                 row = player_map[name]
                 if mode == 'Singles':
@@ -315,57 +355,110 @@ with tabs[1]:
             l_team = [get_data(l1, m_type)]
             if l2: l_team.append(get_data(l2, m_type))
             
-            # RUN ENGINE
+            # Execute
             w_updates, l_updates = engine.calculate_update(w_team, l_team, score_w, score_l)
-            
-            # Save
             save_match(m_type, w_team, l_team, score_w, score_l, w_updates, l_updates)
             
-            st.success("Match Recorded!")
-            cols = st.columns(len(w_updates) + len(l_updates))
+            st.success("Match Processed!")
             
-            for i, p in enumerate(w_updates):
-                name = w_team[i]['name']
-                new_r = engine.get_conservative_rating(p['mu_new'], p['sigma_new'])
-                cols[i].metric(f"{name} (Win)", f"{new_r:.1f}", f"+{p['delta']:.2f} Skill")
-                
-            for i, p in enumerate(l_updates):
-                name = l_team[i]['name']
-                new_r = engine.get_conservative_rating(p['mu_new'], p['sigma_new'])
-                cols[len(w_updates)+i].metric(f"{name} (Loss)", f"{new_r:.1f}", f"{p['delta']:.2f} Skill")
+            # Show Deltas
+            cols = st.columns(len(w_updates) + len(l_updates))
+            all_updates = w_updates + l_updates
+            all_names = [p['name'] for p in w_team] + [p['name'] for p in l_team]
+            
+            for i, p in enumerate(all_updates):
+                new_rating = engine.get_display_rating(p['mu_new'], p['sigma_new'])
+                delta_color = "normal" if p['delta'] > 0 else "off"
+                cols[i].metric(label=all_names[i], value=f"{new_rating:.1f}", delta=f"{p['delta']:.2f}")
 
 # --- TAB 3: PROFILES ---
 with tabs[2]:
-    st.header("Player Profiles")
+    st.header("Leaderboard & Profiles")
     players = get_players()
     
     if not players.empty:
-        # Calculate display ratings
-        players['Singles Rating'] = players.apply(lambda x: engine.get_conservative_rating(x['mu_s'], x['sigma_s']), axis=1).round(1)
-        players['Doubles Rating'] = players.apply(lambda x: engine.get_conservative_rating(x['mu_d'], x['sigma_d']), axis=1).round(1)
+        # Computed Columns
+        players['Singles Rating'] = players.apply(lambda x: engine.get_display_rating(x['mu_s'], x['sigma_s']), axis=1).round(1)
+        players['Doubles Rating'] = players.apply(lambda x: engine.get_display_rating(x['mu_d'], x['sigma_d']), axis=1).round(1)
         
-        st.dataframe(players[['name', 'Singles Rating', 'Doubles Rating', 'joined_date']], use_container_width=True)
+        st.dataframe(
+            players[['name', 'Singles Rating', 'Doubles Rating', 'joined_date']].sort_values(by='Doubles Rating', ascending=False),
+            use_container_width=True,
+            hide_index=True
+        )
         
         st.divider()
-        st.subheader("Player Details")
-        selected = st.selectbox("Select Player", players['name'].unique())
+        c1, c2 = st.columns([1, 2])
         
-        p_row = players[players['name'] == selected].iloc[0]
+        with c1:
+            selected = st.selectbox("View Player Details", players['name'].unique())
+            p_row = players[players['name'] == selected].iloc[0]
+            
+            st.markdown(f"### {selected}")
+            st.caption(f"Joined: {p_row['joined_date']}")
+            st.write(f"**Initial Self-Eval Score:** {p_row['initial_score']}")
+            
+            st.info("Ratings breakdown:")
+            st.write(f"Singles: **{p_row['Singles Rating']}** (μ={p_row['mu_s']:.1f}, σ={p_row['sigma_s']:.1f})")
+            st.write(f"Doubles: **{p_row['Doubles Rating']}** (μ={p_row['mu_d']:.1f}, σ={p_row['sigma_d']:.1f})")
+
+        with c2:
+            st.subheader("Match Log")
+            hist = get_match_history(p_row['id'])
+            if not hist.empty:
+                st.dataframe(hist[['date', 'match_type', 'result', 'score_w', 'score_l', 'change']], hide_index=True)
+            else:
+                st.write("No matches played yet.")
+
+# --- TAB 4: CONFIGURATION (NEW) ---
+with tabs[3]:
+    st.header("⚙️ System Configuration")
+    st.warning("⚠️ CHANGING SETTINGS AND SAVING WILL RESET THE DATABASE (ALL PLAYERS/MATCHES DELETED)")
+    
+    with st.form("config_form"):
+        col1, col2 = st.columns(2)
         
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Singles Skill (Mu)", f"{p_row['mu_s']:.1f}")
-        c2.metric("Singles Uncertainty", f"± {p_row['sigma_s']*3:.1f}")
-        c3.metric("Doubles Skill (Mu)", f"{p_row['mu_d']:.1f}")
-        c4.metric("Doubles Uncertainty", f"± {p_row['sigma_d']*3:.1f}")
+        with col1:
+            st.subheader("1. Mathematical Levers")
+            new_mu = st.number_input("Initial Mean (Mu)", value=current_config['initial_mu'])
+            new_sigma = st.number_input("Initial Uncertainty (Sigma)", value=current_config['initial_sigma'])
+            new_beta = st.number_input("Skill Gap (Beta)", value=current_config['beta'], help="Points of skill difference for ~80% win chance")
+            new_tau = st.number_input("Dynamics (Tau)", value=current_config['tau'], help="Uncertainty added per game")
+            new_lever = st.number_input("Score Weight Factor", value=current_config['score_lever'], help="Higher = Score margin matters more")
+
+        with col2:
+            st.subheader("2. Self-Evaluation Questions")
+            st.info("Edit the table below. Add rows to add new options.")
+            
+            # Load current questions into a DataFrame for editing
+            q_df = pd.DataFrame(current_config['questions'])
+            
+            # Interactive Data Editor
+            edited_df = st.data_editor(
+                q_df, 
+                num_rows="dynamic", 
+                column_config={
+                    "group": st.column_config.TextColumn("Question Group", help="Groups options into one dropdown (e.g. Service)"),
+                    "option": st.column_config.TextColumn("Option Text", help="The answer choice shown to user"),
+                    "score": st.column_config.NumberColumn("Score Impact", help="Points added/subtracted from Mu")
+                },
+                use_container_width=True
+            )
+
+        submit = st.form_submit_button("💾 Save Configuration & RESET Database", type="primary")
         
-        try:
-            st.caption("Initial Self-Evaluation Answers:")
-            st.json(json.loads(p_row['initial_answers']))
-        except: pass
-        
-        st.subheader("Match History")
-        hist = get_match_history(p_row['id'])
-        if not hist.empty:
-            st.dataframe(hist[['date', 'match_type', 'result', 'score_w', 'score_l', 'change']], use_container_width=True)
-        else:
-            st.info("No matches played yet.")
+        if submit:
+            # Reconstruct Config Object
+            new_config = {
+                "initial_mu": new_mu,
+                "initial_sigma": new_sigma,
+                "beta": new_beta,
+                "tau": new_tau,
+                "score_lever": new_lever,
+                "questions": edited_df.to_dict(orient="records")
+            }
+            
+            # Save and Reset
+            save_config_and_reset(new_config)
+            st.success("System updated and database reset. Please refresh the page.")
+            st.rerun()
